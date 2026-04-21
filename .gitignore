@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Strainbench working data — never commit genomes or databases.
+# Anchored to root so we don't accidentally ignore packaged data files at
+# src/strainbench/producer/data/ (the GO-aspects lookup TSV lives there).
+/data/
+/output/
+/tables/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Large bioinformatics inputs/outputs
+*.fna
+*.faa
+*.gbff
+*.gbk
+*.gff
+*.gtf
+ncbi_dataset.zip
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

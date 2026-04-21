@@ -1,0 +1,34 @@
+go_id	aspect	name
+GO:0003674	MF	molecular_function
+GO:0008150	BP	biological_process
+GO:0005575	CC	cellular_component
+GO:0003677	MF	DNA binding
+GO:0003700	MF	DNA-binding transcription factor activity
+GO:0003723	MF	RNA binding
+GO:0003824	MF	catalytic activity
+GO:0004672	MF	protein kinase activity
+GO:0004748	MF	ribonucleoside-diphosphate reductase activity
+GO:0004803	MF	transposase activity
+GO:0005215	MF	transporter activity
+GO:0005524	MF	ATP binding
+GO:0005525	MF	GTP binding
+GO:0008233	MF	peptidase activity
+GO:0008270	MF	zinc ion binding
+GO:0016020	CC	membrane
+GO:0016021	CC	integral component of membrane
+GO:0005737	CC	cytoplasm
+GO:0005840	CC	ribosome
+GO:0009279	CC	cell outer membrane
+GO:0003735	MF	structural constituent of ribosome
+GO:0005886	CC	plasma membrane
+GO:0006260	BP	DNA replication
+GO:0006281	BP	DNA repair
+GO:0006310	BP	DNA recombination
+GO:0006351	BP	DNA-templated transcription
+GO:0006355	BP	regulation of DNA-templated transcription
+GO:0006412	BP	translation
+GO:0006508	BP	proteolysis
+GO:0006810	BP	transport
+GO:0009263	BP	deoxyribonucleotide biosynthetic process
+GO:0015074	BP	DNA integration
+GO:0055085	BP	transmembrane transport
