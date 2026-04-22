@@ -55,6 +55,46 @@ class CDSRecord:
 
 
 @dataclass
+class NonCDSRecord:
+    """A non-protein-coding feature: tRNA, rRNA, ncRNA, tmRNA, or CRISPR repeat.
+
+    Currently extracted to per-strain sidecar FASTA files at
+    `<fasta_dir>/rna/<locus_prefix>.fna` so users can grab 16S sequences
+    for phylogeny etc. without strainbench having to grow a parallel
+    DB-backed pipeline for them. NOT stored in the database — this is
+    a sidecar-only artifact.
+
+    `feature_type` is normalized: NCBI's `/repeat_region` with `/rpt_family=CRISPR`
+    becomes `feature_type='CRISPR'` here so all CRISPR annotations land
+    under one consistent label.
+    """
+
+    feature_type: str
+    """One of: 'tRNA', 'rRNA', 'ncRNA', 'tmRNA', 'CRISPR'."""
+
+    locus_tag: str
+    """Per-strain unique identifier. Synthesized from feature_type + index
+    if NCBI didn't supply one (which happens for many CRISPR repeat_regions)."""
+
+    nuc_accession: str
+    """The replicon accession (chromosome / contig)."""
+
+    location: str
+    """GenBank-style location, e.g. '38420..38493' or 'complement(123..1625)'."""
+
+    direction: str
+    """'F' (forward) or 'R' (reverse / complement)."""
+
+    nt_sequence: str
+    nt_length: int
+    product: str
+    """Free-text description from /product, /rpt_family, or /note (whichever
+    is most informative for this feature type)."""
+
+    notes: str | None = None
+
+
+@dataclass
 class StrainRecord:
     """One genome. Produced by a parser, consumed by the ingestion step."""
 
@@ -76,6 +116,9 @@ class StrainRecord:
     """Absolute or relative path to the original input file."""
 
     cds_records: list[CDSRecord] = field(default_factory=list)
+    non_cds_records: list[NonCDSRecord] = field(default_factory=list)
+    """Non-protein-coding features (tRNA/rRNA/ncRNA/tmRNA/CRISPR). Sidecar
+    only — written to <fasta_dir>/rna/<prefix>.fna at ingest, not in DB."""
 
     biosample_id: str | None = None
     bioproject_id: str | None = None

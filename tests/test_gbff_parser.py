@@ -148,6 +148,31 @@ def test_isolate_qualifier_used_when_strain_absent(tmp_path):
     assert rec.strain_name == "AMBV-2211"
 
 
+def test_non_cds_features_extracted(synthetic_gbff):
+    """tRNA / rRNA / CRISPR repeat_region should be captured into non_cds_records.
+    Non-CRISPR repeat_region (tandem repeats, etc.) should NOT be captured.
+    """
+    rec = parse_gbff(synthetic_gbff)
+    types = [r.feature_type for r in rec.non_cds_records]
+
+    # Synthetic fixture has 1 tRNA + 1 rRNA + 1 CRISPR repeat + 1 tandem repeat.
+    # Tandem should be skipped, leaving 3 records.
+    assert sorted(types) == ["CRISPR", "rRNA", "tRNA"]
+    assert "repeat_region" not in types  # bare type is normalized to 'CRISPR'
+
+    by_type = {r.feature_type: r for r in rec.non_cds_records}
+    # tRNA: forward strand
+    assert by_type["tRNA"].direction == "F"
+    assert by_type["tRNA"].product == "tRNA-Ala(GGC)"
+    assert by_type["tRNA"].locus_tag == "TESTPFX_RS00025"
+    # rRNA: reverse strand
+    assert by_type["rRNA"].direction == "R"
+    assert by_type["rRNA"].product == "16S ribosomal RNA"
+    # CRISPR: locus_tag synthesized because /locus_tag was absent
+    assert by_type["CRISPR"].locus_tag.endswith("CRISPR_0000") or "CRISPR" in by_type["CRISPR"].locus_tag
+    assert "CRISPR" in by_type["CRISPR"].product
+
+
 def test_empty_gbff_raises(tmp_path):
     empty = tmp_path / "empty.gbff"
     empty.write_text("")

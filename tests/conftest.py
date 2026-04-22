@@ -74,6 +74,42 @@ def _build_synthetic_gbff(path: Path) -> None:
                 "pseudo": [""],
             },
         ),
+        # tRNA — should land in non_cds_records / rna sidecar
+        SeqFeature(
+            location=SimpleLocation(1400, 1474, strand=1),
+            type="tRNA",
+            qualifiers={
+                "locus_tag": ["TESTPFX_RS00025"],
+                "product": ["tRNA-Ala(GGC)"],
+            },
+        ),
+        # rRNA on the reverse strand — common pattern for 16S in many bacteria
+        SeqFeature(
+            location=SimpleLocation(1500, 1700, strand=-1),
+            type="rRNA",
+            qualifiers={
+                "locus_tag": ["TESTPFX_RS00030"],
+                "product": ["16S ribosomal RNA"],
+            },
+        ),
+        # CRISPR repeat_region — captured even without /locus_tag (synthesized)
+        SeqFeature(
+            location=SimpleLocation(1750, 1900, strand=1),
+            type="repeat_region",
+            qualifiers={
+                "rpt_family": ["CRISPR"],
+                "note": ["CRISPR array consisting of 5 repeat units"],
+            },
+        ),
+        # NON-CRISPR repeat_region — must NOT be captured
+        SeqFeature(
+            location=SimpleLocation(1920, 1960, strand=1),
+            type="repeat_region",
+            qualifiers={
+                "rpt_type": ["tandem"],
+                "note": ["short tandem repeat"],
+            },
+        ),
     ]
 
     record = SeqRecord(

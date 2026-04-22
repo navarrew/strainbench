@@ -102,3 +102,97 @@ def schema_version(db_path: str | Path) -> int | None:
     with connect(db_path, read_only=True) as conn:
         row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
         return row["v"] if row and row["v"] is not None else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cluster-run resolution — single canonical implementation used everywhere.
+# Lives here (not in a producer module) because every producer subcommand
+# needs to pick a cluster_run, and previously this logic was copy-pasted in
+# four separate files. Each divergence cost at least one user-visible bug.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def resolve_cluster_run_id(
+    conn: sqlite3.Connection,
+    requested: int | None,
+    *,
+    sequence_type_hint: str | None = None,
+) -> int:
+    """Pick a cluster_run_id for any operation that targets one.
+
+    Resolution order:
+      1. Explicit `requested` (validated to exist) → used as-is.
+      2. `sequence_type_hint` ('protein' or 'nucleotide') → most recent
+         active run of that type. Raises if no such run exists.
+      3. Default → most recent active protein run. Falls back to most
+         recent active run of any type if no protein run exists.
+
+    The protein default keeps the cluster_table xlsx and strain-anchored
+    views pointed at the canonical "gene families" view; nucleotide runs
+    are an overlay (see the `nt_subcluster` column). The hint mode lets
+    `--sequence-type nucleotide` find an nt run automatically without
+    needing the user to look up its cluster_run_id.
+    """
+    if requested is not None:
+        row = conn.execute(
+            "SELECT cluster_run_id FROM cluster_runs WHERE cluster_run_id = ?",
+            (requested,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"cluster_run_id={requested} not found in DB")
+        return int(requested)
+
+    if sequence_type_hint in {"protein", "nucleotide"}:
+        row = conn.execute(
+            "SELECT cluster_run_id FROM cluster_runs "
+            "WHERE is_active = 1 AND sequence_type = ? "
+            "ORDER BY cluster_run_id DESC LIMIT 1",
+            (sequence_type_hint,),
+        ).fetchone()
+        if row is not None:
+            return int(row["cluster_run_id"])
+        raise ValueError(
+            f"no active cluster_run of sequence_type={sequence_type_hint!r}. "
+            f"Run `strainbench cluster --sequence-type {sequence_type_hint} ...` first."
+        )
+
+    row = conn.execute(
+        """
+        SELECT cluster_run_id FROM cluster_runs
+        WHERE is_active = 1
+        ORDER BY (sequence_type = 'protein') DESC, cluster_run_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            "No active cluster_runs in DB. Run `strainbench cluster` first."
+        )
+    return int(row["cluster_run_id"])
+
+
+def resolve_nt_cluster_run_id(
+    conn: sqlite3.Connection,
+    requested: int | None,
+) -> int | None:
+    """Pick a nucleotide cluster_run to overlay (or None if none exists).
+
+    Used by the strain-anchored xlsx export to find the nt sub-cluster
+    information to overlay alongside the canonical protein view. Returns
+    None instead of raising when no nt run exists, because the overlay
+    is optional — the strain-anchored view still works without it.
+
+    If `requested` is given, validates and returns it (any cluster_run_id,
+    not just nt). If unspecified, returns the most recent active nt run,
+    or None if there are none.
+    """
+    if requested is not None:
+        return resolve_cluster_run_id(conn, requested)
+    row = conn.execute(
+        """
+        SELECT cluster_run_id FROM cluster_runs
+        WHERE is_active = 1 AND sequence_type = 'nucleotide'
+        ORDER BY cluster_run_id DESC LIMIT 1
+        """
+    ).fetchone()
+    return int(row["cluster_run_id"]) if row else None

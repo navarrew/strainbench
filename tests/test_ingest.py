@@ -62,6 +62,29 @@ def test_inserts_strain_and_cds_rows(fresh_db, fasta_dir, synthetic_gbff):
         }
 
 
+def test_writes_rna_sidecar_when_non_cds_features_present(fresh_db, fasta_dir, synthetic_gbff):
+    """tRNA/rRNA/CRISPR features should land in <fasta_dir>/rna/<prefix>.fna —
+    a parallel to the fna/ and faa/ sidecars but for non-CDS data."""
+    record = parse_gbff(synthetic_gbff)
+    with core_db.connect(fresh_db) as conn:
+        ingest_strain(conn, record, fasta_dir)
+
+    rna_path = fasta_dir / "rna" / "TESTPFX.fna"
+    assert rna_path.exists(), "rna/ sidecar should be written when non-CDS features exist"
+
+    text = rna_path.read_text()
+    # 3 records — tRNA + rRNA + CRISPR — should each have a header line
+    assert text.count(">") == 3
+    # Headers carry the feature_type tag so users can grep across files
+    assert "[tRNA]" in text
+    assert "[rRNA]" in text
+    assert "[CRISPR]" in text
+    # Product info preserved
+    assert "16S ribosomal RNA" in text
+    # Non-CRISPR repeat_region should NOT appear — tandem-only filter at parser level
+    assert "tandem" not in text.lower()
+
+
 def test_writes_sidecar_fasta_files(fresh_db, fasta_dir, synthetic_gbff):
     record = parse_gbff(synthetic_gbff)
     with core_db.connect(fresh_db) as conn:

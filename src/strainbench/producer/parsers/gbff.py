@@ -20,10 +20,13 @@ from Bio import SeqIO
 from Bio.SeqFeature import AfterPosition, BeforePosition, CompoundLocation
 from Bio.SeqUtils import gc_fraction
 
-from strainbench.core.models import CDSRecord, StrainRecord
+from strainbench.core.models import CDSRecord, NonCDSRecord, StrainRecord
 
 _VALID_ASSEMBLY_LEVELS = {"Complete", "Chromosome", "Scaffold", "Contig", "Unknown"}
 _MIN_AA_LENGTH = 30
+
+# Non-CDS feature types we extract verbatim into the rna/ sidecar.
+_NON_CDS_RNA_TYPES = {"tRNA", "rRNA", "ncRNA", "tmRNA"}
 
 
 def parse_gbff(
@@ -54,13 +57,19 @@ def parse_gbff(
         raise ValueError(f"No GenBank records found in {path}")
 
     cds_records: list[CDSRecord] = []
+    non_cds_records: list[NonCDSRecord] = []
+    non_cds_index = 0   # for synthesizing locus_tags when /locus_tag is missing
     for record in records:
         for feature in record.features:
-            if feature.type != "CDS":
-                continue
-            cds = _build_cds_record(feature, record)
-            if cds is not None:
-                cds_records.append(cds)
+            if feature.type == "CDS":
+                cds = _build_cds_record(feature, record)
+                if cds is not None:
+                    cds_records.append(cds)
+            else:
+                non_cds = _build_non_cds_record(feature, record, non_cds_index)
+                if non_cds is not None:
+                    non_cds_records.append(non_cds)
+                    non_cds_index += 1
 
     if not cds_records:
         raise ValueError(f"No translatable CDS features found in {path}")
@@ -87,6 +96,7 @@ def parse_gbff(
         source_format="gbff",
         source_file=str(path),
         cds_records=cds_records,
+        non_cds_records=non_cds_records,
     )
 
 
@@ -124,6 +134,62 @@ def _build_cds_record(feature, record) -> CDSRecord | None:
         gc_pct=round(100 * gc_fraction(nt_sequence), 2),
         annotation=qualifiers.get("product", ["hypothetical protein"])[0],
         gene_name=qualifiers.get("gene", [None])[0],
+        notes=_describe_special_cases(feature),
+    )
+
+
+def _build_non_cds_record(feature, record, index: int) -> NonCDSRecord | None:
+    """Build a NonCDSRecord from a tRNA/rRNA/ncRNA/tmRNA or CRISPR repeat_region.
+
+    Returns None for any feature type we don't capture (CDS, gene, source,
+    misc_feature, gap, regulatory, …) and for repeat_region features that
+    aren't CRISPR-related (tandem repeats, etc.).
+
+    NCBI's CRISPR annotations are unreliable — we capture them anyway as a
+    convenience for browsing, but biologists doing real CRISPR analysis
+    should use dedicated tools (CRISPRCasFinder, MinCED, etc.) rather than
+    trusting these.
+    """
+    qualifiers = feature.qualifiers
+    ftype = feature.type
+
+    if ftype in _NON_CDS_RNA_TYPES:
+        product = qualifiers.get("product", [""])[0].strip() or ftype
+        normalized_type = ftype
+    elif ftype == "repeat_region":
+        # Only keep CRISPR-flavored repeat_regions; skip tandem repeats etc.
+        markers = " ".join(
+            qualifiers.get("rpt_family", []) + qualifiers.get("note", [])
+        ).upper()
+        if "CRISPR" not in markers:
+            return None
+        normalized_type = "CRISPR"
+        # Use the most informative free-text we have
+        product = (qualifiers.get("rpt_family", [""])[0]
+                   or qualifiers.get("note", [""])[0]
+                   or "CRISPR repeat region").strip()
+    else:
+        return None
+
+    # Synthesize locus_tag when missing (CRISPR repeats often have none).
+    locus_tag = qualifiers.get("locus_tag", [None])[0]
+    if not locus_tag:
+        locus_tag = f"{record.id}_{normalized_type}_{index:04d}"
+
+    try:
+        nt_sequence = str(feature.extract(record.seq))
+    except Exception:  # noqa: BLE001 - origin-spanning joins, etc.
+        return None
+
+    return NonCDSRecord(
+        feature_type=normalized_type,
+        locus_tag=locus_tag,
+        nuc_accession=record.id,
+        location=_format_location(feature.location),
+        direction="R" if feature.location.strand == -1 else "F",
+        nt_sequence=nt_sequence,
+        nt_length=len(nt_sequence),
+        product=product,
         notes=_describe_special_cases(feature),
     )
 

@@ -32,6 +32,8 @@ import csv
 import sqlite3
 import sys
 from dataclasses import dataclass
+
+from strainbench.core.db import resolve_cluster_run_id as _resolve_cluster_run_id
 from importlib.resources import files
 from pathlib import Path
 from typing import Iterable
@@ -791,34 +793,10 @@ def _load_go_aspects() -> dict[str, tuple[str, str]]:
     return lookup
 
 
-def _resolve_cluster_run_id(conn: sqlite3.Connection, requested: int | None) -> int:
-    """Pick a cluster_run for annotation import. Prefers protein runs by default.
-
-    Annotations come from external tools that ran on the protein cluster reps
-    (`strainbench export-reps` produces a protein FASTA). Importing those
-    against a nucleotide cluster_run would silently mismatch all names — the
-    namespace is INERS_NT_xxxxxx vs INERS_xxxxxx. Defaulting to protein
-    avoids that footgun. Caller can override with explicit cluster_run_id.
-    """
-    if requested is not None:
-        row = conn.execute(
-            "SELECT cluster_run_id FROM cluster_runs WHERE cluster_run_id = ?",
-            (requested,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"cluster_run_id={requested} not found")
-        return requested
-    row = conn.execute(
-        """
-        SELECT cluster_run_id FROM cluster_runs
-        WHERE is_active = 1
-        ORDER BY (sequence_type = 'protein') DESC, cluster_run_id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    if row is None:
-        raise ValueError("No active cluster_runs in DB")
-    return int(row["cluster_run_id"])
+# resolve_cluster_run_id moved to core.db — imported at the top of this file.
+# Annotation import particularly benefits from protein-by-default because
+# annotators run on the protein cluster reps (`strainbench export-reps`),
+# so importing against a nucleotide run silently mismatches all names.
 
 
 def _load_cluster_name_map(

@@ -27,6 +27,11 @@ from pathlib import Path
 import pandas as pd
 import xlsxwriter
 
+from strainbench.core.db import (
+    resolve_cluster_run_id as _resolve_cluster_run_id,
+    resolve_nt_cluster_run_id as _resolve_nt_cluster_run_id,
+)
+
 # Color hexes lifted from strain-comp's 6_formatxl.py so the visual style
 # is unchanged for users moving over.
 _COLOR_CLUSTER_BG = "black"
@@ -103,59 +108,9 @@ def export_cluster_table_xlsx(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_cluster_run_id(
-    conn: sqlite3.Connection, requested: int | None
-) -> int:
-    """Pick a cluster_run for export. Prefers protein runs over nucleotide.
-
-    With both protein and nucleotide runs in the DB, the protein run is the
-    canonical "gene families" view that the cluster_table and strain-anchored
-    xlsx are organized around. Nucleotide runs are an overlay (see the
-    `nt_subcluster` column). User can always force a specific run via
-    `cluster_run_id=N`.
-    """
-    if requested is not None:
-        row = conn.execute(
-            "SELECT cluster_run_id FROM cluster_runs WHERE cluster_run_id = ?",
-            (requested,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"cluster_run_id={requested} not found in DB")
-        return requested
-
-    row = conn.execute(
-        """
-        SELECT cluster_run_id FROM cluster_runs
-        WHERE is_active = 1
-        ORDER BY (sequence_type = 'protein') DESC, cluster_run_id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    if row is None:
-        raise ValueError(
-            "No active cluster_runs in DB. Run `strainbench cluster` first."
-        )
-    return int(row["cluster_run_id"])
-
-
-def _resolve_nt_cluster_run_id(
-    conn: sqlite3.Connection, requested: int | None
-) -> int | None:
-    """Pick a nucleotide cluster_run to overlay (or None if none exists).
-
-    Returns None if the user passed `requested=None` and the DB contains no
-    active nucleotide run — caller should treat that as "no nt overlay column".
-    """
-    if requested is not None:
-        return _resolve_cluster_run_id(conn, requested)
-    row = conn.execute(
-        """
-        SELECT cluster_run_id FROM cluster_runs
-        WHERE is_active = 1 AND sequence_type = 'nucleotide'
-        ORDER BY cluster_run_id DESC LIMIT 1
-        """
-    ).fetchone()
-    return int(row["cluster_run_id"]) if row else None
+# The resolver functions used to live here; they've moved to core.db to
+# avoid the four-copies problem. The aliased imports at the top of this
+# file keep existing call sites working without any further changes.
 
 
 def _load_strains(conn: sqlite3.Connection) -> pd.DataFrame:

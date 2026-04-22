@@ -26,8 +26,10 @@ the spreadsheet.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from strainbench.core.db import resolve_cluster_run_id as _resolve_cluster_run_id
 
 
 @dataclass
@@ -38,6 +40,12 @@ class HeatmapResult:
     n_clusters_excluded: int
     n_strains: int
     output_png: str | None
+    # Dendrogram orderings — populated whether or not we persist them to the
+    # DB. Consumers (e.g. export-strainlist with an explicit --cluster-run-id)
+    # can call compute_hierarchical_order with write_orderings=False and read
+    # strain_order straight from the result.
+    strain_order: list[int] = field(default_factory=list)
+    cluster_order: list[int] = field(default_factory=list)
 
 
 def compute_hierarchical_order(
@@ -51,6 +59,9 @@ def compute_hierarchical_order(
     figsize: tuple[float, float] = (50.0, 50.0),
     write_orderings: bool = True,
     write_strain_order: bool = True,
+    strain_label_stride: int | None = None,
+    cluster_label_stride: int | None = None,
+    label_density_threshold: int = 1250,
 ) -> HeatmapResult:
     """Run hierarchical clustering on the strain × cluster presence matrix.
 
@@ -72,6 +83,18 @@ def compute_hierarchical_order(
             heatmaps (e.g. protein + nucleotide) — only one of them should
             drive the strain axis of the spreadsheet, by convention the
             protein run (canonical pan-genome view).
+        strain_label_stride: Show every Nth strain label along the X-axis.
+            None → auto (stride chosen so visible labels ≤ threshold).
+            0 → no labels. 1 → every label. N → every Nth (after dendrogram
+            reordering, so labels are evenly spaced visually).
+        cluster_label_stride: Same idea for Y-axis cluster labels. Cluster
+            labels show 'CLUSTER_NAME (gene_name)' when a /gene qualifier
+            exists in any member, else just 'CLUSTER_NAME'. Auto-stride is
+            usually what you want — Gardnerella's 12k clusters get stride 7,
+            iners's 3.5k gets stride 2, small datasets get every label.
+        label_density_threshold: Auto-stride target. The auto formula picks
+            the smallest stride such that visible_labels ≤ threshold. 2000
+            is a rough sweet spot on a 50"-tall figure rendered at 200 dpi.
     """
     # Heavy imports localized so non-heatmap CLI commands don't pay the cost.
     import sys
@@ -106,19 +129,77 @@ def compute_hierarchical_order(
             "that this cluster_run has any single-copy clusters."
         )
 
-    # Run clustermap. yticklabels=False to avoid drawing thousands of cluster labels.
-    sns.set(font_scale=0.05)
+    n_clusters, n_strains = matrix.shape
+
+    # Auto-pick strides if caller didn't specify. Formula: smallest stride
+    # such that the number of visible labels stays below the threshold.
+    if strain_label_stride is None:
+        strain_label_stride = _auto_stride(n_strains, label_density_threshold)
+    if cluster_label_stride is None:
+        cluster_label_stride = _auto_stride(n_clusters, label_density_threshold)
+
+    show_strain_labels = strain_label_stride > 0
+    show_cluster_labels = cluster_label_stride > 0
+
+    # Capture the ID-keyed axes BEFORE rename — we need these to map
+    # dendrogram positions back to strain_id / cluster_id for persistence
+    # below (otherwise the post-rename matrix.columns is locus_prefix
+    # strings and the UPDATE WHERE strain_id=… would silently match nothing).
+    original_strain_ids = list(matrix.columns)
+    original_cluster_ids = list(matrix.index)
+
+    # Map matrix index/columns from raw IDs to human-readable labels so
+    # seaborn's tick rendering shows strain names + cluster (+gene) names
+    # (or blanks where the stride says to suppress).
+    strain_label_map = _strain_labels(conn) if show_strain_labels else {}
+    cluster_label_map = _cluster_labels(conn, cluster_run_id) if show_cluster_labels else {}
+    matrix = matrix.rename(columns=strain_label_map, index=cluster_label_map)
+
+    # Font scales calibrated to figure size and visible label density.
+    # The goal: each VISIBLE label gets enough room to be readable when the
+    # PNG is viewed at native resolution (200 dpi → ~10,000 px square).
+    font_scale = _pick_font_scale(
+        figsize,
+        n_strains // max(strain_label_stride, 1) if show_strain_labels else 0,
+        n_clusters // max(cluster_label_stride, 1) if show_cluster_labels else 0,
+    )
+    sns.set(font_scale=font_scale)
+
     g = sns.clustermap(
         matrix,
         method=method,
         cmap=color,
         vmin=0, vmax=1,
         figsize=figsize,
-        cbar=False,
-        xticklabels=True,
-        yticklabels=False,
+        cbar_pos=None,   # fully remove the colorbar axes — cbar=False alone
+                         # can leave a ghost placeholder rectangle in the
+                         # top-left corner in some seaborn versions
+        xticklabels=show_strain_labels,
+        yticklabels=show_cluster_labels,
     )
     g.ax_heatmap.set(xlabel="STRAINS", ylabel="CLUSTERS")
+
+    # Rasterize ONLY the heatmap's cell-grid image — labels, title, axes,
+    # and dendrograms stay as vectors. This is the difference between a
+    # 100 MB PDF (every cell is its own vector rectangle, e.g. 4.6M cells
+    # for Gardnerella) and a ~2 MB PDF with the grid as an embedded raster
+    # and everything text-like infinitely zoomable. Only the Axes' images
+    # (from pcolormesh/imshow) get rasterized, not its children.
+    for child in g.ax_heatmap.get_children():
+        # QuadMesh (from pcolormesh) is what seaborn uses for the grid.
+        # Rasterize everything that's an image-like artist; leave text alone.
+        if hasattr(child, "set_rasterized"):
+            name = type(child).__name__
+            if name in {"QuadMesh", "AxesImage", "PolyCollection"}:
+                child.set_rasterized(True)
+
+    # Apply stride: blank every label that isn't on a stride boundary AFTER
+    # dendrogram reordering, so labels are evenly spaced in the displayed
+    # image (not in the original matrix order).
+    if show_strain_labels and strain_label_stride > 1:
+        _apply_stride_to_axis(g.ax_heatmap, axis="x", stride=strain_label_stride)
+    if show_cluster_labels and cluster_label_stride > 1:
+        _apply_stride_to_axis(g.ax_heatmap, axis="y", stride=cluster_label_stride)
 
     # Top-of-image title — tells you which cluster_run this PNG is for when
     # you have multiple (protein + nucleotide) side by side.
@@ -127,9 +208,20 @@ def compute_hierarchical_order(
             f"{run_meta['label']}   —   "
             f"{run_meta['sequence_type']} clustering "
             f"(id≥{run_meta['pct_identity']}%, cov≥{run_meta['coverage']}%)   —   "
-            f"{matrix.shape[0]:,} clusters × {matrix.shape[1]} strains   "
+            f"{n_clusters:,} clusters × {n_strains} strains   "
             f"[{method} linkage]"
         )
+        # Note in the title when stride is in use, so viewers know labels
+        # are subsampled (not random).
+        stride_notes = []
+        if show_cluster_labels and cluster_label_stride > 1:
+            stride_notes.append(f"cluster labels: every {cluster_label_stride}th")
+        if show_strain_labels and strain_label_stride > 1:
+            stride_notes.append(f"strain labels: every {strain_label_stride}th")
+        if not show_cluster_labels:
+            stride_notes.append("cluster labels off")
+        if stride_notes:
+            title += "   (" + ", ".join(stride_notes) + ")"
         # Figure is 50" by default; title sits above the figure at ~1.5× the
         # axis label scale. Big enough to read when the PNG is rendered at
         # 200 dpi but not comically large when zoomed out.
@@ -138,11 +230,21 @@ def compute_hierarchical_order(
     if output_png:
         output_png = Path(output_png)
         output_png.parent.mkdir(parents=True, exist_ok=True)
+        # Format is auto-detected from the path's extension by matplotlib.
+        # For vector formats (.pdf, .svg, .eps), dpi is irrelevant — the text
+        # and shapes are stored as vectors that scale infinitely. For raster
+        # formats (.png, .jpg, .tiff), use 200 dpi for a 10k×10k image.
+        # For vector formats (.pdf, .svg) we still pass dpi — it controls
+        # the resolution of any RASTERIZED elements inside (the heatmap grid
+        # we rasterized above). 200 dpi on a 50" figure = ~10,000 px, plenty
+        # for zooming. Text and dendrograms remain vector regardless.
         plt.savefig(output_png, dpi=200, bbox_inches="tight", pad_inches=0.2)
     plt.close("all")
 
-    cluster_order = matrix.index[g.dendrogram_row.reordered_ind].tolist()
-    strain_order = matrix.columns[g.dendrogram_col.reordered_ind].tolist()
+    # Map dendrogram positions back to the original IDs (not the renamed
+    # display labels). reordered_ind is positional, so it indexes both views.
+    cluster_order = [original_cluster_ids[i] for i in g.dendrogram_row.reordered_ind]
+    strain_order = [original_strain_ids[i] for i in g.dendrogram_col.reordered_ind]
 
     if write_orderings:
         _write_orderings(
@@ -158,6 +260,8 @@ def compute_hierarchical_order(
         n_clusters_excluded=len(excluded_cluster_ids),
         n_strains=len(strain_order),
         output_png=str(output_png) if output_png else None,
+        strain_order=strain_order,
+        cluster_order=cluster_order,
     )
 
 
@@ -166,33 +270,115 @@ def compute_hierarchical_order(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_cluster_run_id(conn: sqlite3.Connection, requested: int | None) -> int:
-    """Pick a cluster_run for hierarchical clustering.
+def _strain_labels(conn: sqlite3.Connection) -> dict[int, str]:
+    """Map strain_id → locus_prefix for X-axis tick labels.
 
-    Prefers protein runs by default — that's the canonical "gene families"
-    view biologists work with. Nucleotide runs have their own ordering
-    meaning (within-species lineages) that generally shouldn't drive the
-    pan-genome heatmap. Caller can force a specific run with `cluster_run_id`.
+    Locus prefix is the friendly strain ID (e.g. 'HMPREF0520', 'HXT39') —
+    short enough to print on a heatmap column without overlap.
     """
-    if requested is not None:
-        row = conn.execute(
-            "SELECT cluster_run_id FROM cluster_runs WHERE cluster_run_id = ?",
-            (requested,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"cluster_run_id={requested} not found")
-        return requested
-    row = conn.execute(
+    return {
+        int(row["strain_id"]): row["locus_prefix"]
+        for row in conn.execute("SELECT strain_id, locus_prefix FROM strains")
+    }
+
+
+def _cluster_labels(conn: sqlite3.Connection, cluster_run_id: int) -> dict[int, str]:
+    """Map cluster_id → 'CLUSTER_NAME (gene_name)' or just 'CLUSTER_NAME'.
+
+    The pooled gene-name aggregation matches the xlsx export's column —
+    so a biologist seeing 'INERS_000005 (nrdF)' in the heatmap recognizes
+    the same identifier they'd see in cluster_table.xlsx.
+    """
+    rows = conn.execute(
         """
-        SELECT cluster_run_id FROM cluster_runs
-        WHERE is_active = 1
-        ORDER BY (sequence_type = 'protein') DESC, cluster_run_id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    if row is None:
-        raise ValueError("No active cluster_runs in DB. Run `strainbench cluster` first.")
-    return int(row["cluster_run_id"])
+        SELECT
+            c.cluster_id,
+            c.cluster_name,
+            (SELECT GROUP_CONCAT(DISTINCT cds.gene_name)
+             FROM cluster_membership m
+             JOIN cds ON cds.cds_id = m.cds_id
+             WHERE m.cluster_id = c.cluster_id
+               AND cds.gene_name IS NOT NULL
+               AND cds.gene_name != '')        AS gene_names
+        FROM clusters c
+        WHERE c.cluster_run_id = ?
+        """,
+        (cluster_run_id,),
+    ).fetchall()
+    out: dict[int, str] = {}
+    for row in rows:
+        cid = int(row["cluster_id"])
+        name = row["cluster_name"]
+        genes = row["gene_names"]
+        if genes:
+            # Take just the first gene name to keep the label short — full
+            # pooled set is in the xlsx; here we just need a recognizable hint.
+            first_gene = genes.split(",")[0].strip()
+            out[cid] = f"{name} ({first_gene})"
+        else:
+            out[cid] = name
+    return out
+
+
+def _auto_stride(n_items: int, threshold: int) -> int:
+    """Pick the smallest stride such that visible label count ≤ threshold.
+
+    Stride 1 = every label. Stride 5 = every 5th. The point is to keep the
+    LABELED rows/columns evenly spread without overcrowding.
+    """
+    if n_items <= 0 or threshold <= 0:
+        return 1
+    if n_items <= threshold:
+        return 1
+    # ceil(n_items / threshold)
+    return -(-n_items // threshold)
+
+
+def _apply_stride_to_axis(ax, axis: str, stride: int) -> None:
+    """Blank every tick label that isn't a multiple of `stride` on `axis`.
+
+    Called AFTER seaborn renders the clustermap, so the dendrogram ordering
+    is already applied and the stride is applied to the DISPLAYED rows
+    (not the matrix-order rows). That keeps labels evenly spaced in the
+    final image.
+    """
+    if axis == "x":
+        labels = [t.get_text() for t in ax.get_xticklabels()]
+        kept = [lbl if i % stride == 0 else "" for i, lbl in enumerate(labels)]
+        ax.set_xticklabels(kept)
+    elif axis == "y":
+        labels = [t.get_text() for t in ax.get_yticklabels()]
+        kept = [lbl if i % stride == 0 else "" for i, lbl in enumerate(labels)]
+        ax.set_yticklabels(kept)
+
+
+def _pick_font_scale(
+    figsize: tuple[float, float],
+    n_visible_x_labels: int,
+    n_visible_y_labels: int,
+) -> float:
+    """Compute a seaborn font_scale that sizes labels to fit their per-tick slot.
+
+    seaborn's default base font is ~12pt. font_scale=1.0 → 12pt, 0.5 → 6pt.
+    Each VISIBLE tick label needs roughly `figsize_inches / n_visible_labels`
+    of axis space. A label at f points needs roughly f/72 inches of slot. So:
+        max readable scale = (slot_inches × 72) / 12 = slot_inches × 6
+    We take the tighter of the two axes' constraints, then cap at a sensible
+    maximum so labels don't dominate the figure on small heatmaps.
+    """
+    width_in, height_in = figsize
+    constraints = [0.6]  # cap so labels never get absurdly huge
+    if n_visible_x_labels > 0:
+        constraints.append((width_in / n_visible_x_labels) * 6)
+    if n_visible_y_labels > 0:
+        constraints.append((height_in / n_visible_y_labels) * 6)
+    return max(min(constraints), 0.05)  # never go below the historical floor
+
+
+# resolve_cluster_run_id moved to core.db — imported at the top of this file.
+# Protein-first default matches the biology here: nucleotide runs capture
+# within-species lineage structure at a finer grain, but the canonical
+# pan-genome heatmap is the protein-cluster view.
 
 
 def _build_presence_matrix(

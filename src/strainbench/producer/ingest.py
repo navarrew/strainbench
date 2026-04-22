@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from strainbench.core.models import CDSRecord, StrainRecord
+from strainbench.core.models import CDSRecord, NonCDSRecord, StrainRecord
 
 _FASTA_LINE_WIDTH = 80
 
@@ -85,8 +85,10 @@ def ingest_strain(
     fasta_dir = Path(fasta_dir)
     fna_path = fasta_dir / "fna" / f"{record.locus_prefix}.fna"
     faa_path = fasta_dir / "faa" / f"{record.locus_prefix}.faa"
+    rna_path = fasta_dir / "rna" / f"{record.locus_prefix}.fna"
     fna_path.parent.mkdir(parents=True, exist_ok=True)
     faa_path.parent.mkdir(parents=True, exist_ok=True)
+    rna_path.parent.mkdir(parents=True, exist_ok=True)
 
     with conn:
         existing = conn.execute(
@@ -115,6 +117,16 @@ def ingest_strain(
         _insert_cds_rows(conn, strain_id, record.cds_records)
         _write_fasta(fna_path, record.cds_records, kind="nt", locus_prefix=record.locus_prefix)
         _write_fasta(faa_path, record.cds_records, kind="aa", locus_prefix=record.locus_prefix)
+        # Sidecar: non-CDS features (tRNA/rRNA/ncRNA/tmRNA/CRISPR). Only
+        # write the file if this strain actually has any — no point creating
+        # 124 empty placeholder files for strains with no annotated RNAs.
+        if record.non_cds_records:
+            _write_rna_fasta(rna_path, record.non_cds_records,
+                             locus_prefix=record.locus_prefix)
+        elif rna_path.exists():
+            # Re-ingest case: previous run had RNAs, this one doesn't (or
+            # they got filtered). Drop the stale file.
+            rna_path.unlink()
 
     return strain_id, status
 
@@ -245,3 +257,34 @@ def _write_fasta(
             f.write(f">{locus_prefix}|{c.locus_tag} {' '.join(descriptor_bits)}\n")
             for line_start in range(0, len(seq), _FASTA_LINE_WIDTH):
                 f.write(seq[line_start : line_start + _FASTA_LINE_WIDTH] + "\n")
+
+
+def _write_rna_fasta(
+    path: Path,
+    records: list[NonCDSRecord],
+    *,
+    locus_prefix: str,
+) -> None:
+    """Write per-strain non-CDS FASTA (tRNA/rRNA/ncRNA/tmRNA/CRISPR).
+
+    Header format mirrors the CDS sidecars but tags each record with its
+    feature_type and product so users can grep for e.g. '16S' or 'CRISPR'
+    across all strains' files.
+
+        >LOCUSPREFIX|LOCUS_TAG [tRNA] [locus_prefix=…] [product=tRNA-Ala(GGC)] [location=38420..38493]
+        GGGGGCATAGCTC...
+    """
+    with path.open("w") as f:
+        for r in records:
+            descriptor_bits = [
+                f"[{r.feature_type}]",
+                f"[locus_prefix={locus_prefix}]",
+            ]
+            if r.product:
+                descriptor_bits.append(f"[product={r.product}]")
+            descriptor_bits.append(f"[location={r.location}]")
+            if r.notes:
+                descriptor_bits.append(f"[note={r.notes}]")
+            f.write(f">{locus_prefix}|{r.locus_tag} {' '.join(descriptor_bits)}\n")
+            for line_start in range(0, len(r.nt_sequence), _FASTA_LINE_WIDTH):
+                f.write(r.nt_sequence[line_start : line_start + _FASTA_LINE_WIDTH] + "\n")

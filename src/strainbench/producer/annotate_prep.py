@@ -69,16 +69,15 @@ def prepare_annotation_workdir(
             sequence_type="protein",
         )
 
-    # Re-resolve the cluster_run_id for the manifest.
+    # Re-resolve the cluster_run_id for the manifest. Uses the canonical
+    # protein-preferring resolver (before this consolidation, this was an
+    # inline query with the old "most-recent-any" semantics — a footgun
+    # waiting to happen once users had protein + nucleotide runs).
     import sqlite3
+    from strainbench.core.db import resolve_cluster_run_id
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        if cluster_run_id is None:
-            row = conn.execute(
-                "SELECT cluster_run_id FROM cluster_runs "
-                "WHERE is_active = 1 ORDER BY cluster_run_id DESC LIMIT 1"
-            ).fetchone()
-            cluster_run_id = int(row["cluster_run_id"])
+        cluster_run_id = resolve_cluster_run_id(conn, cluster_run_id)
         reps_written = conn.execute(
             "SELECT COUNT(*) AS n FROM clusters "
             "WHERE cluster_run_id = ? AND representative_aa_seq IS NOT NULL",

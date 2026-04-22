@@ -213,13 +213,23 @@ Typical timing: ~10 s per run for ~150k CDSs.
 ### 5. Hierarchical clustering (heatmap)
 
 ```bash
-strainbench heatmap --db iners.db --output-png iners_heatmap.png
+# Single heatmap (most-recent active protein run, by default):
+strainbench heatmap --db iners.db --output-png iners_heatmap.pdf
+
+# Both protein AND nucleotide heatmaps in one go (auto-named with suffix):
+strainbench heatmap --db iners.db --output-png iners_heatmap.pdf --all-runs
+# → produces iners_heatmap_protein.pdf and iners_heatmap_nucleotide.pdf
 ```
 
 Runs seaborn clustermap on the strain × cluster presence/absence matrix.
 Writes the resulting strain ordering and cluster ordering back to the DB
 as `strains.display_order` and `clusters.display_order`. Subsequent xlsx
 exports use this ordering automatically.
+
+**Format tip**: use `.pdf` for the heatmap. Vector text means strain
+locus_prefixes and cluster IDs (with gene names where known) stay crisp
+at any zoom — much better than .png for hunting through 10,000+ rows.
+PNG works too if you prefer; matplotlib auto-detects from the extension.
 
 ### 6. Functional annotation (the big section — see below)
 

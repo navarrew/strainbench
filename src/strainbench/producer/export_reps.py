@@ -25,6 +25,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from strainbench.core.db import resolve_cluster_run_id as _resolve_cluster_run_id
+
 _FASTA_LINE_WIDTH = 80
 
 
@@ -267,55 +269,4 @@ def _write_full_length_only(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_cluster_run_id(
-    conn: sqlite3.Connection,
-    requested: int | None,
-    *,
-    sequence_type_hint: str | None = None,
-) -> int:
-    """Pick a cluster_run for export.
-
-    Resolution order:
-      1. Explicit `requested` (the --cluster-run-id flag) — used as-is.
-      2. If `sequence_type_hint` is given, pick the most recent active run
-         of that type (nucleotide OR protein, whatever the user asked for).
-      3. Fallback: most recent active protein run; if none, most recent any.
-
-    Step 2 is what makes `--sequence-type nucleotide` do the right thing
-    without needing a paired --cluster-run-id — it looks for a nucleotide
-    run automatically.
-    """
-    if requested is not None:
-        row = conn.execute(
-            "SELECT cluster_run_id FROM cluster_runs WHERE cluster_run_id = ?",
-            (requested,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"cluster_run_id={requested} not found in DB")
-        return requested
-
-    if sequence_type_hint in {"protein", "nucleotide"}:
-        row = conn.execute(
-            "SELECT cluster_run_id FROM cluster_runs "
-            "WHERE is_active = 1 AND sequence_type = ? "
-            "ORDER BY cluster_run_id DESC LIMIT 1",
-            (sequence_type_hint,),
-        ).fetchone()
-        if row is not None:
-            return int(row["cluster_run_id"])
-        raise ValueError(
-            f"no active cluster_run of sequence_type={sequence_type_hint!r}. "
-            f"Run `strainbench cluster --sequence-type {sequence_type_hint} ...` first."
-        )
-
-    row = conn.execute(
-        """
-        SELECT cluster_run_id FROM cluster_runs
-        WHERE is_active = 1
-        ORDER BY (sequence_type = 'protein') DESC, cluster_run_id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    if row is None:
-        raise ValueError("No active cluster_runs in DB")
-    return int(row["cluster_run_id"])
+# resolve_cluster_run_id moved to core.db — imported at the top of this file.

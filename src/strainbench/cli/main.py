@@ -11,6 +11,7 @@ Subcommands so far:
     export-reps — export cluster representative sequences as FASTA
     annotate-prep — generate a workdir with shell templates for external annotators
     import-annotation — import annotator output (single file or whole workdir)
+    export-strainlist — write strainlist.txt (one strain header per line) in dendrogram order
     status — human-readable snapshot of a strainbench DB
 
 Producer-side imports are deferred until their subcommand actually runs,
@@ -329,6 +330,8 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
                 strain_range=strain_range,
                 color=args.color,
                 write_strain_order=write_strain,
+                strain_label_stride=args.strain_label_stride,
+                cluster_label_stride=args.cluster_label_stride,
             )
         except ValueError as exc:
             print(f"\nHeatmap failed: {exc}", file=sys.stderr)
@@ -586,6 +589,47 @@ def cmd_annotate_prep(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_strainlist(args: argparse.Namespace) -> int:
+    import time
+    from strainbench.producer.export_strainlist import export_strainlist
+
+    db_path = Path(args.db)
+    if not db_path.exists():
+        print(f"Database not found: {db_path}", file=sys.stderr)
+        return 1
+    if args.cluster_run_id is not None and args.sequence_type is not None:
+        # Both can be given but they have to agree (validated in export_strainlist)
+        pass
+
+    if args.cluster_run_id is not None or args.sequence_type is not None:
+        print(
+            f"Computing strain ordering for "
+            f"{'cluster_run_id=' + str(args.cluster_run_id) if args.cluster_run_id else 'sequence_type=' + args.sequence_type}"
+            f" (this may take ~minutes for big datasets — only the dendrogram, no PNG)..."
+        )
+    t0 = time.time()
+    try:
+        summary = export_strainlist(
+            db_path, args.output,
+            cluster_run_id=args.cluster_run_id,
+            sequence_type=args.sequence_type,
+        )
+    except ValueError as exc:
+        print(f"\nstrainlist export failed: {exc}", file=sys.stderr)
+        return 1
+    dt = time.time() - t0
+    print(f"\nWrote {summary.n_strains} strain headers to {summary.output_path} ({dt:.1f}s)")
+    if summary.recomputed:
+        print(
+            f"  ordering: dendrogram of cluster_run_id={summary.cluster_run_id} "
+            f"({summary.sequence_type}) — recomputed, NOT persisted to "
+            f"strains.display_order"
+        )
+    else:
+        print("  ordering: strains.display_order (whatever the last `heatmap` run wrote)")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from strainbench.producer.status import collect_status, format_status
 
@@ -732,11 +776,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_heatmap.add_argument(
         "--output-png", default=None,
-        help="Path for the heatmap PNG (default: <db_dir>/heatmap.png). "
-             "When used with --all-runs, this is treated as a base name and "
+        help="Path for the heatmap output (default: <db_dir>/heatmap.png). "
+             "Format is auto-detected from the extension: .png/.jpg = raster, "
+             ".pdf/.svg = vector (recommended for big heatmaps — labels stay "
+             "crisp at any zoom). With --all-runs this is a base name; "
              "'_<sequence_type>' is inserted before the extension "
-             "(e.g. gard_heatmap.png → gard_heatmap_protein.png + "
-             "gard_heatmap_nucleotide.png).",
+             "(e.g. gard_heatmap.pdf → gard_heatmap_protein.pdf + "
+             "gard_heatmap_nucleotide.pdf).",
     )
     p_heatmap.add_argument(
         "--cluster-run-id", type=int, default=None,
@@ -748,6 +794,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate one PNG per active cluster_run (protein + nucleotide, "
              "etc.). The protein run drives strains.display_order; nucleotide "
              "runs write only their own clusters.display_order.",
+    )
+    p_heatmap.add_argument(
+        "--strain-label-stride", type=int, default=None,
+        help="Show every Nth strain label along the X-axis. 0=hide, 1=all, "
+             "N=every Nth (default: auto — picks a stride that keeps "
+             "visible labels under ~2000).",
+    )
+    p_heatmap.add_argument(
+        "--cluster-label-stride", type=int, default=None,
+        help="Show every Nth cluster label (with gene name when available) "
+             "along the Y-axis. 0=hide, 1=all, N=every Nth (default: auto). "
+             "For a 12k-cluster Gardnerella matrix, auto picks ~7.",
     )
     p_heatmap.set_defaults(func=cmd_heatmap)
 
@@ -863,6 +921,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-export reps.faa even if the file already exists.",
     )
     p_prep.set_defaults(func=cmd_annotate_prep)
+
+    p_strainlist = subparsers.add_parser(
+        "export-strainlist",
+        help="Export a strainlist.txt file (one strain header per line) in "
+             "dendrogram order. Default uses strains.display_order; "
+             "--sequence-type or --cluster-run-id recomputes for that run.",
+    )
+    p_strainlist.add_argument("--db", required=True)
+    p_strainlist.add_argument(
+        "-o", "--output", required=True,
+        help="Output file path (e.g. strainlist.txt or iners_strains_nt.txt).",
+    )
+    p_strainlist.add_argument(
+        "--cluster-run-id", type=int, default=None,
+        help="Recompute strain dendrogram from this run (slow but doesn't "
+             "disturb strains.display_order).",
+    )
+    p_strainlist.add_argument(
+        "--sequence-type", choices=["protein", "nucleotide"], default=None,
+        help="Recompute from the most recent active run of this type. "
+             "Common case: --sequence-type nucleotide for the strain phylogeny "
+             "view, while keeping the canonical protein-based ordering "
+             "elsewhere.",
+    )
+    p_strainlist.set_defaults(func=cmd_export_strainlist)
 
     p_status = subparsers.add_parser(
         "status",
