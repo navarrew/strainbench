@@ -13,6 +13,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Annotation sources that try to label every protein. Low coverage on these
+# generally means the tool didn't finish or was run on the wrong input.
+_GENERAL_PURPOSE_SOURCES = frozenset({
+    "COG", "KEGG", "GO", "Pfam", "TIGRFAM", "PANTHER", "SUPERFAMILY", "SMART",
+})
+
+# Other sources (AMRFinder, CAZy, DefenseFinder, PADLOC, EC, …) are
+# specialized — they label a deliberately narrow class of proteins (AMR
+# genes, carb-active enzymes, defense systems, enzymes). Low coverage on
+# these is expected biology, not a problem.
+
+
 @dataclass
 class ClusterRunStatus:
     cluster_run_id: int
@@ -187,9 +199,15 @@ def format_status(status: DatasetStatus) -> str:
                     f"{ann['n_clusters']:>6,} clusters ({ann['coverage_pct']:>5.1f}%)  "
                     f"{ann['n_rows']:>6,} rows   latest {ann['latest_at']}{file_note}"
                 )
-            # Flag low coverage — suggests the annotator didn't finish or wasn't run on the right input.
+            # Only warn for general-purpose annotators (COG, KEGG, GO, Pfam, …).
+            # Specialized annotators (AMRFinder, CAZy, DefenseFinder, …) legitimately
+            # hit a narrow slice of proteins — low coverage there is biology, not a bug.
             for ann in run.annotation_summary:
-                if ann["coverage_pct"] < 10.0 and run.cluster_count > 100:
+                if (
+                    ann["source"] in _GENERAL_PURPOSE_SOURCES
+                    and ann["coverage_pct"] < 10.0
+                    and run.cluster_count > 100
+                ):
                     lines.append(
                         f"      ❗ {ann['source']} coverage is only {ann['coverage_pct']:.1f}% — "
                         f"expected >60% from a full annotation run."
