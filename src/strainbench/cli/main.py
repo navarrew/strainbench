@@ -27,6 +27,31 @@ from strainbench import __version__
 from strainbench.core import db as core_db
 
 
+def _derive_accession(path: Path) -> str:
+    """Best-effort derivation of an NCBI GCF/GCA accession from a gbff path.
+
+    Handles the two layouts strainbench accepts:
+
+      * Flat (strain-comp convention, each file named after its accession):
+          /path/to/GCF_000160875.1.gbff          → 'GCF_000160875.1'
+
+      * NCBI datasets' nested layout (the raw unzipped structure, canonical
+        filenames inside per-accession directories):
+          /path/to/GCF_000160875.1/genomic.gbff  → 'GCF_000160875.1'
+
+    Falls back to the filename stem for anything that doesn't look like
+    either (which is fine — the only consequence is that metadata lookup
+    won't find a matching row, so those strains get `species=Unknown`).
+    """
+    stem = path.stem
+    if stem.startswith(("GCF_", "GCA_")):
+        return stem
+    parent = path.parent.name
+    if parent.startswith(("GCF_", "GCA_")):
+        return parent
+    return stem
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     target = Path(args.path)
     existed = target.exists()
@@ -88,7 +113,6 @@ def cmd_parse_gbff(args: argparse.Namespace) -> int:
 
 def cmd_ingest(args: argparse.Namespace) -> int:
     # Producer-only deps; lazy import.
-    import glob
     import time
 
     from strainbench.producer.ingest import ingest_records
@@ -105,14 +129,18 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
     fasta_dir = Path(args.fasta_dir)
 
-    # Resolve the input list: either one --gbff file, or all *.gbff in --gbff-dir.
+    # Resolve the input list: either one --gbff file, or all *.gbff found under --gbff-dir.
     if args.gbff and args.gbff_dir:
         print("--gbff and --gbff-dir are mutually exclusive", file=sys.stderr)
         return 2
     if args.gbff:
         gbff_paths = [Path(args.gbff)]
     elif args.gbff_dir:
-        gbff_paths = sorted(Path(p) for p in glob.glob(f"{args.gbff_dir}/*.gbff"))
+        # Recursive search: handles both flat layouts (GCF_*.gbff files in one
+        # directory — strain-comp's convention) and NCBI's native nested
+        # layout (<root>/<accession>/genomic.gbff).
+        root = Path(args.gbff_dir)
+        gbff_paths = sorted(root.rglob("*.gbff"))
     else:
         print("must supply either --gbff or --gbff-dir", file=sys.stderr)
         return 2
@@ -120,7 +148,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     if args.limit:
         gbff_paths = gbff_paths[: args.limit]
     if not gbff_paths:
-        print("no .gbff files matched", file=sys.stderr)
+        print(f"no .gbff files found under {args.gbff_dir}", file=sys.stderr)
         return 1
 
     metadata_table = load_assembly_table(args.metadata) if args.metadata else {}
@@ -130,7 +158,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     records = []
     parse_failures: list[tuple[Path, str]] = []
     for path in gbff_paths:
-        accession = path.stem
+        accession = _derive_accession(path)
         try:
             records.append(parse_gbff(path, metadata=metadata_table.get(accession)))
         except Exception as exc:  # noqa: BLE001
@@ -237,6 +265,10 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
     # Auto-migrate older DBs so display_order columns exist.
     core_db.initialize(db_path)
 
+    if args.all_runs and args.cluster_run_id is not None:
+        print("--all-runs and --cluster-run-id are mutually exclusive", file=sys.stderr)
+        return 2
+
     strain_range = None
     if args.range:
         try:
@@ -246,41 +278,90 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
             print(f"--range must look like 'min:max' (got {args.range!r})", file=sys.stderr)
             return 2
 
-    output_png = Path(args.output_png) if args.output_png else (db_path.parent / "heatmap.png")
+    base_output = Path(args.output_png) if args.output_png else (db_path.parent / "heatmap.png")
 
-    print(
-        f"Hierarchical clustering on {db_path}\n"
-        f"  method:        {args.method}\n"
-        f"  strain range:  {strain_range or 'all single-copy clusters'}\n"
-        f"  output PNG:    {output_png}"
-    )
-    t0 = time.time()
+    # Build the list of (cluster_run_id, sequence_type, output_png_path) tuples
+    # to process. Single-run is the common case; --all-runs iterates.
     conn = core_db.connect(db_path)
     try:
-        result = compute_hierarchical_order(
-            conn,
-            method=args.method,
-            output_png=output_png,
-            strain_range=strain_range,
-            color=args.color,
-        )
-    except ValueError as exc:
-        print(f"\nHeatmap failed: {exc}", file=sys.stderr)
-        return 1
+        if args.all_runs:
+            runs = list(conn.execute(
+                "SELECT cluster_run_id, sequence_type FROM cluster_runs "
+                "WHERE is_active = 1 "
+                "ORDER BY (sequence_type = 'protein') DESC, cluster_run_id ASC"
+            ).fetchall())
+            if not runs:
+                print("No active cluster_runs in DB.", file=sys.stderr)
+                return 1
+            # Protein first, so it writes strain display_order; nt runs skip that.
+            jobs = [
+                (int(r["cluster_run_id"]), r["sequence_type"],
+                 _derive_heatmap_path(base_output, r["sequence_type"]))
+                for r in runs
+            ]
+        else:
+            # Single-run mode — use the resolver's default (prefers protein).
+            jobs = [(args.cluster_run_id, None, base_output)]
     finally:
         conn.close()
-    dt = time.time() - t0
 
-    print(
-        f"\nDone in {dt:.1f}s.\n"
-        f"  cluster_run_id:           {result.cluster_run_id}\n"
-        f"  clusters in clustering:   {result.n_clusters_in_clustering:,}\n"
-        f"  clusters excluded:        {result.n_clusters_excluded:,} (multi-copy or out of range)\n"
-        f"  strains:                  {result.n_strains}\n"
-        f"  display_order written to clusters and strains tables.\n"
-        f"  Re-run `strainbench export-xlsx` to get a dendrogram-ordered spreadsheet."
-    )
+    for cluster_run_id, seq_type, output_png in jobs:
+        print(
+            f"\nHierarchical clustering on {db_path}"
+            + (f" (cluster_run_id={cluster_run_id}, {seq_type})" if args.all_runs else "")
+        )
+        print(f"  method:        {args.method}")
+        print(f"  strain range:  {strain_range or 'all single-copy clusters'}")
+        print(f"  output PNG:    {output_png}")
+
+        t0 = time.time()
+        conn = core_db.connect(db_path)
+        try:
+            # When running multiple, only the FIRST job (protein, per the ORDER BY
+            # above) writes strains.display_order — nt heatmaps shouldn't override
+            # the canonical pan-genome strain axis.
+            write_strain = (not args.all_runs) or (seq_type == "protein")
+            result = compute_hierarchical_order(
+                conn,
+                cluster_run_id=cluster_run_id,
+                method=args.method,
+                output_png=output_png,
+                strain_range=strain_range,
+                color=args.color,
+                write_strain_order=write_strain,
+            )
+        except ValueError as exc:
+            print(f"\nHeatmap failed: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
+        dt = time.time() - t0
+
+        strain_note = (
+            "strain display_order written"
+            if write_strain
+            else "strain display_order preserved (protein run is canonical)"
+        )
+        print(
+            f"  Done in {dt:.1f}s. "
+            f"{result.n_clusters_in_clustering:,} clusters clustered, "
+            f"{result.n_clusters_excluded:,} excluded. {strain_note}."
+        )
+
+    print("\nRe-run `strainbench export-xlsx` to get a dendrogram-ordered spreadsheet.")
     return 0
+
+
+def _derive_heatmap_path(base: Path, sequence_type: str) -> Path:
+    """Insert '_<sequence_type>' before the extension of the base path.
+
+    Examples:
+        gard_heatmap.png + 'protein'    → gard_heatmap_protein.png
+        gard_heatmap.png + 'nucleotide' → gard_heatmap_nucleotide.png
+        /out/dir/foo     + 'protein'    → /out/dir/foo_protein
+    """
+    base = Path(base)
+    return base.with_name(f"{base.stem}_{sequence_type}{base.suffix}")
 
 
 def cmd_export_xlsx(args: argparse.Namespace) -> int:
@@ -651,7 +732,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_heatmap.add_argument(
         "--output-png", default=None,
-        help="Path for the heatmap PNG (default: <db_dir>/heatmap.png).",
+        help="Path for the heatmap PNG (default: <db_dir>/heatmap.png). "
+             "When used with --all-runs, this is treated as a base name and "
+             "'_<sequence_type>' is inserted before the extension "
+             "(e.g. gard_heatmap.png → gard_heatmap_protein.png + "
+             "gard_heatmap_nucleotide.png).",
+    )
+    p_heatmap.add_argument(
+        "--cluster-run-id", type=int, default=None,
+        help="Which cluster_run to cluster (default: most recent active "
+             "protein run). Mutually exclusive with --all-runs.",
+    )
+    p_heatmap.add_argument(
+        "--all-runs", action="store_true",
+        help="Generate one PNG per active cluster_run (protein + nucleotide, "
+             "etc.). The protein run drives strains.display_order; nucleotide "
+             "runs write only their own clusters.display_order.",
     )
     p_heatmap.set_defaults(func=cmd_heatmap)
 

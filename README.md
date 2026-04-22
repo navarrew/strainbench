@@ -159,10 +159,15 @@ assminfo-bioproject,assminfo-biosample-accession,assminfo-level \
 ### 3. Parse + ingest into the DB
 
 ```bash
+# --gbff-dir is searched recursively, so BOTH layouts work:
+#   * NCBI's native:  ncbi_dataset/data/GCF_*/genomic.gbff
+#   * Flat (strain-comp):  gbff/GCF_*.gbff
+# The accession is derived from the parent directory name (NCBI layout) or
+# the filename stem (flat layout) — automatically.
 strainbench ingest \
     --db iners.db \
     --fasta-dir iners_fasta/ \
-    --gbff-dir ncbi_dataset/data/   \   # all */genomic.gbff get picked up
+    --gbff-dir ncbi_dataset/data/ \
     --metadata assembly_metadata.tab
 ```
 

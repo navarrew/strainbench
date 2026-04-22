@@ -70,7 +70,13 @@ def export_cluster_representatives(
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        cluster_run_id = _resolve_cluster_run_id(conn, cluster_run_id)
+        # Pass sequence_type as a hint so --sequence-type nucleotide (without
+        # an explicit --cluster-run-id) picks the nt run instead of the
+        # protein run. Avoids the footgun where mismatched type + run silently
+        # produces an empty FASTA.
+        cluster_run_id = _resolve_cluster_run_id(
+            conn, cluster_run_id, sequence_type_hint=sequence_type,
+        )
         run_row = conn.execute(
             "SELECT sequence_type FROM cluster_runs WHERE cluster_run_id = ?",
             (cluster_run_id,),
@@ -262,10 +268,23 @@ def _write_full_length_only(
 
 
 def _resolve_cluster_run_id(
-    conn: sqlite3.Connection, requested: int | None
+    conn: sqlite3.Connection,
+    requested: int | None,
+    *,
+    sequence_type_hint: str | None = None,
 ) -> int:
-    """Pick a cluster_run — prefers protein runs when unspecified (see
-    export_xlsx's rationale)."""
+    """Pick a cluster_run for export.
+
+    Resolution order:
+      1. Explicit `requested` (the --cluster-run-id flag) — used as-is.
+      2. If `sequence_type_hint` is given, pick the most recent active run
+         of that type (nucleotide OR protein, whatever the user asked for).
+      3. Fallback: most recent active protein run; if none, most recent any.
+
+    Step 2 is what makes `--sequence-type nucleotide` do the right thing
+    without needing a paired --cluster-run-id — it looks for a nucleotide
+    run automatically.
+    """
     if requested is not None:
         row = conn.execute(
             "SELECT cluster_run_id FROM cluster_runs WHERE cluster_run_id = ?",
@@ -274,6 +293,20 @@ def _resolve_cluster_run_id(
         if row is None:
             raise ValueError(f"cluster_run_id={requested} not found in DB")
         return requested
+
+    if sequence_type_hint in {"protein", "nucleotide"}:
+        row = conn.execute(
+            "SELECT cluster_run_id FROM cluster_runs "
+            "WHERE is_active = 1 AND sequence_type = ? "
+            "ORDER BY cluster_run_id DESC LIMIT 1",
+            (sequence_type_hint,),
+        ).fetchone()
+        if row is not None:
+            return int(row["cluster_run_id"])
+        raise ValueError(
+            f"no active cluster_run of sequence_type={sequence_type_hint!r}. "
+            f"Run `strainbench cluster --sequence-type {sequence_type_hint} ...` first."
+        )
 
     row = conn.execute(
         """

@@ -180,9 +180,24 @@ def _format_strain_header(row: pd.Series) -> str:
     Format mirrors strain-comp's strainlist.txt convention so the existing
     `; Complete]` / `; Scaffold]` / `; Contig]` markers can drive header
     coloring downstream.
+
+    NCBI frequently bakes the strain identifier into the organism name:
+       species  = 'Lactobacillus iners AB-1'    + strain  = 'AB-1'
+       species  = 'Gardnerella sp. DNF01159'    + strain  = 'DNF01159'
+    Naively concatenating produces 'Lactobacillus iners AB-1 AB-1' which
+    is ugly and confusing. We de-dupe here: if the species string already
+    ends with the strain name, just use the species verbatim.
     """
+    species = (row["species"] or "Unknown").strip()
+    strain = (row["strain_name"] or "").strip()
+    if strain and (species == strain or species.endswith(" " + strain)):
+        display = species
+    elif strain:
+        display = f"{species} {strain}"
+    else:
+        display = species
     return (
-        f"{row['locus_prefix']} | {row['species']} {row['strain_name']} "
+        f"{row['locus_prefix']} | {display} "
         f"[{row['assembly_id'] or '?'}; "
         f"{row['biosample_id'] or '?'}; "
         f"{row['bioproject_id'] or '?'}; "

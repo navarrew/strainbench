@@ -429,6 +429,57 @@ def test_annotation_columns_appear_after_strain_block(tmp_path):
     assert len(df.columns) == 13  # no more, no less
 
 
+def test_strain_header_dedupes_when_organism_contains_strain():
+    """NCBI bakes the strain into the organism name for unspeciated isolates
+    (e.g. 'Gardnerella sp. DNF01159') AND also reports it in /strain. We
+    must not produce 'Gardnerella sp. DNF01159 DNF01159' in the header."""
+    from strainbench.producer.export_xlsx import _format_strain_header
+    import pandas as _pd
+
+    # 1. Strain baked into organism name → no duplication
+    row = _pd.Series({
+        "locus_prefix": "HXT39",
+        "species": "Gardnerella sp. DNF01159",
+        "strain_name": "DNF01159",
+        "assembly_id": "GCF_049244215.1",
+        "biosample_id": "SAMN15393823",
+        "bioproject_id": "PRJNA639145",
+        "assembly_level": "Complete",
+    })
+    h = _format_strain_header(row)
+    # Should appear once, not twice
+    assert h.count("DNF01159") == 1
+    # And should still include the assembly metadata
+    assert "GCF_049244215.1" in h
+    assert "Complete" in h
+
+    # 2. Same identity case
+    row_same = _pd.Series({
+        "locus_prefix": "X",
+        "species": "DNF01159",
+        "strain_name": "DNF01159",
+        "assembly_id": "GCF_X",
+        "biosample_id": "S",
+        "bioproject_id": "P",
+        "assembly_level": "Contig",
+    })
+    h_same = _format_strain_header(row_same)
+    assert h_same.count("DNF01159") == 1
+
+    # 3. Distinct strain (e.g., classic format) → both appear once each
+    row_normal = _pd.Series({
+        "locus_prefix": "Y",
+        "species": "Lactobacillus iners",
+        "strain_name": "AB-1",
+        "assembly_id": "GCF_000177755.1",
+        "biosample_id": "SAMN02470230",
+        "bioproject_id": "PRJNA43549",
+        "assembly_level": "Contig",
+    })
+    h_normal = _format_strain_header(row_normal)
+    assert "Lactobacillus iners AB-1" in h_normal
+
+
 def test_export_raises_when_no_cluster_run(tmp_path):
     """Trying to export from a DB that has no cluster_runs yet should fail clearly."""
     db_path = tmp_path / "empty.db"
