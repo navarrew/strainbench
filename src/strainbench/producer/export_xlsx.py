@@ -79,11 +79,16 @@ def export_cluster_table_xlsx(
         strains_df = _load_strains(conn)
         clusters_df = _load_clusters(conn, cluster_run_id)
         wide = _build_pivot(conn, cluster_run_id, clusters_df, strains_df)
-        annotation_columns = _build_annotation_columns(conn, cluster_run_id, clusters_df)
+        annotation_columns, extra_gene_names = _build_annotation_columns(
+            conn, cluster_run_id, clusters_df
+        )
     finally:
         conn.close()
 
-    _write_xlsx(output_path, clusters_df, strains_df, wide, annotation_columns)
+    _write_xlsx(
+        output_path, clusters_df, strains_df, wide,
+        annotation_columns, extra_gene_names,
+    )
 
     return ExportSummary(
         output_path=str(output_path),
@@ -186,8 +191,18 @@ def _format_strain_header(row: pd.Series) -> str:
 
 
 def _load_clusters(conn: sqlite3.Connection, cluster_run_id: int) -> pd.DataFrame:
-    # If display_order is set (from a heatmap run), it dominates.
-    # Otherwise sort by abundance, matching the pre-heatmap default.
+    """Load cluster metadata plus the pooled NCBI gene names per cluster.
+
+    The correlated subquery aggregates DISTINCT `cds.gene_name` across each
+    cluster's members via GROUP_CONCAT. NULL/empty gene names are excluded,
+    so clusters where no member had a /gene qualifier get a NULL result
+    (rendered as 'none' at write time, matching strain-comp's convention).
+
+    Sort priority:
+      1. display_order (populated by hierarchical clustering, if run)
+      2. member_count DESC (abundance)
+      3. cluster_name (stable tiebreaker)
+    """
     return pd.read_sql_query(
         """
         SELECT
@@ -199,7 +214,13 @@ def _load_clusters(conn: sqlite3.Connection, cluster_run_id: int) -> pd.DataFram
             ROUND(avg_gc_pct, 2)  AS gc_pct,
             ROUND(gc_spread, 2)   AS gc_spread,
             avg_aa_length        AS aa_length,
-            flags
+            flags,
+            (SELECT GROUP_CONCAT(DISTINCT c.gene_name)
+             FROM cluster_membership m
+             JOIN cds c ON c.cds_id = m.cds_id
+             WHERE m.cluster_id = clusters.cluster_id
+               AND c.gene_name IS NOT NULL
+               AND c.gene_name != '')           AS pooled_gene_names
         FROM clusters
         WHERE cluster_run_id = ?
         ORDER BY
@@ -250,19 +271,38 @@ def _build_annotation_columns(
     conn: sqlite3.Connection,
     cluster_run_id: int,
     clusters_df: pd.DataFrame,
-) -> list[tuple[str, dict[int, str]]]:
+) -> tuple[list[tuple[str, dict[int, str]]], dict[int, set[str]]]:
     """Build extra columns for the xlsx from the cluster_annotations table.
 
-    Returns a list of (column_header, {cluster_id: cell_string}) pairs,
-    one per (source, category) combination that has any rows. Returns []
-    if cluster_annotations is empty for this run.
+    Returns:
+      columns: list of (column_header, {cluster_id: cell_string}) pairs,
+        one per (source, category) combination that has any rows.
+      extra_gene_names: {cluster_id: set[str]} — gene symbols extracted from
+        KEGG_KO rows' `name` field (eggNOG-mapper's Preferred_name). The
+        caller merges these into the pan-genome 'NCBI gene names' column so
+        biologists searching for short symbols (lacZ, dnaA) find them in
+        the same place regardless of whether NCBI or eggNOG provided them.
+
+    Returns ([], {}) if cluster_annotations is empty for this run.
 
     Column naming:
-        source='GO', category='MF'  → 'GO_MF'
-        source='COG', category=None or any → 'COG'
-        source='KEGG', category='pathway' → 'KEGG_pathway'
-        source='KEGG', category=None (KO) → 'KEGG_KO'
+        source='GO',  category='MF'                    → 'GO_MF'
+        source='COG', category=letter (J, K, L, …)     → 'COG'
+        source='COG', category='group' (DeepNOG)       → 'COG_group'
+        source='KEGG', category='pathway' / 'module'   → 'KEGG_{cat}'
+        source='KEGG', category=NULL (KO entries)      → 'KEGG_KO'
+
+    KEGG_KO special handling (the bit that handles emapper × kofamscan dup):
+      - Same K-number from multiple tools → merged to a single entry.
+      - When merging, prefer the form carrying an e-value: 'K00001 (e: 1e-50)'
+        wins over the bare 'K00001' for the same cluster.
+      - Gene names that eggNOG attaches to KEGG KOs (Preferred_name) are
+        stripped from the KEGG_KO cell and surfaced in the NCBI gene names
+        column instead.
     """
+    import json as _json
+    from collections import defaultdict
+
     try:
         ann = pd.read_sql_query(
             """
@@ -277,34 +317,38 @@ def _build_annotation_columns(
             params=(cluster_run_id,),
         )
     except Exception:
-        return []
+        return [], {}
     if ann.empty:
-        return []
+        return [], {}
 
-    import json as _json
+    extra_gene_names: dict[int, set[str]] = defaultdict(set)
+
+    def _kegg_evalue(extra_raw: object) -> float | None:
+        """Pull below-threshold e-value from a KEGG row's `extra` JSON, or None."""
+        if not extra_raw:
+            return None
+        try:
+            extra = _json.loads(extra_raw)
+        except (TypeError, ValueError):
+            return None
+        if extra.get("below_threshold") and extra.get("evalue") is not None:
+            try:
+                return float(extra["evalue"])
+            except (TypeError, ValueError):
+                return None
+        return None
 
     def _entry_text(row: pd.Series) -> str:
-        """Build the cell entry for this annotation row.
+        """Build the cell entry for non-KEGG_KO rows.
 
-        Below-threshold KEGG hits get formatted as 'KOxxxxx (e: 1.2e-50)' so
-        biologists can see at a glance which calls are guesses vs. confident.
-        Other rows get 'code name' (or just 'code' if name missing).
+        For sources without code+name conflicts (COG categories, GO terms,
+        Pfam IDs, etc.) the simple 'code name' form is correct. The KEGG_KO
+        column gets dedicated dedup-by-code logic below — entry_text isn't
+        used for it.
         """
         code = str(row.get("code") or "").strip()
         if not code:
             return ""
-        # Below-threshold flagging (currently only kofamscan emits this).
-        extra_raw = row.get("extra")
-        if extra_raw:
-            try:
-                extra = _json.loads(extra_raw)
-            except (TypeError, ValueError):
-                extra = {}
-            if extra.get("below_threshold"):
-                evalue = extra.get("evalue")
-                if evalue is not None:
-                    return f"{code} (e: {evalue:.1e})"
-                return f"{code} (sub-significant)"
         name = str(row.get("name") or "").strip()
         return f"{code} {name}".strip()
 
@@ -327,15 +371,51 @@ def _build_annotation_columns(
 
     ann["col"] = ann.apply(lambda r: _col_name(r["source"], r.get("category")), axis=1)
 
+    # ── KEGG_KO: special dedup-by-code logic ─────────────────────────────────
+    # For each cluster, group rows by K-number (code). When the same K-number
+    # comes from multiple tools (emapper + kofamscan, common case), the row
+    # whose `extra` carries a below-threshold e-value wins the tiebreak so
+    # the e-value annotation 'K00001 (e: 1.2e-50)' is preserved. Gene names
+    # (Preferred_name from emapper) are pulled out into extra_gene_names —
+    # they belong in the NCBI gene names column, not stuck to the KO code.
+    kegg_ko_rows = ann[ann["col"] == "KEGG_KO"]
+    kegg_ko_map: dict[int, str] = {}
+    if not kegg_ko_rows.empty:
+        # Per-cluster: code → best-formatted entry for that code
+        per_cluster: dict[int, dict[str, str]] = defaultdict(dict)
+        for row in kegg_ko_rows.itertuples(index=False):
+            code = (row.code or "").strip()
+            if not code:
+                continue
+            cluster_id = int(row.cluster_id)
+            # Pull gene name → extras (later merged into NCBI gene names column)
+            name = (row.name or "").strip() if row.name else ""
+            if name:
+                extra_gene_names[cluster_id].add(name)
+            # Build candidate entry: bare or with e-value
+            evalue = _kegg_evalue(row.extra)
+            candidate = f"{code} (e: {evalue:.1e})" if evalue is not None else code
+            existing = per_cluster[cluster_id].get(code)
+            if existing is None:
+                per_cluster[cluster_id][code] = candidate
+            elif "(e:" in candidate and "(e:" not in existing:
+                # New row carries e-value, existing doesn't → upgrade to new
+                per_cluster[cluster_id][code] = candidate
+            # else: existing already has e-value (or both lack it) → keep existing
+        kegg_ko_map = {
+            cid: "; ".join(code_to_entry[c] for c in sorted(code_to_entry))
+            for cid, code_to_entry in per_cluster.items()
+        }
+
+    # ── Non-KEGG_KO columns: existing aggregate-then-dedup-by-string logic ──
     grouped = (
-        ann.groupby(["col", "cluster_id"])["entry"]
-        .apply(lambda s: "; ".join(sorted(x for x in s if x)))
+        ann[ann["col"] != "KEGG_KO"]
+        .groupby(["col", "cluster_id"])["entry"]
+        .apply(lambda s: "; ".join(sorted({x for x in s if x})))
         .reset_index()
     )
 
-    # Build a parallel "description" column for KEGG, populated from the
-    # `description` field (kofamscan's KO definition text). This gives the
-    # user a column showing what each KO actually IS, alongside the bare KO ID.
+    # ── KEGG_description column (KO definition text from kofamscan) ─────────
     kegg_desc_rows = ann[(ann["source"] == "KEGG") & ann["description"].notna() & (ann["description"].str.strip() != "")]
     kegg_desc_map: dict[int, str] = {}
     if not kegg_desc_rows.empty:
@@ -355,6 +435,8 @@ def _build_annotation_columns(
     seen = set(grouped["col"].unique())
     if kegg_desc_map:
         seen.add("KEGG_description")
+    if kegg_ko_map:
+        seen.add("KEGG_KO")
     ordered = [c for c in preferred if c in seen] + sorted(c for c in seen if c not in preferred)
 
     columns: list[tuple[str, dict[int, str]]] = []
@@ -362,10 +444,13 @@ def _build_annotation_columns(
         if col == "KEGG_description":
             columns.append((col, kegg_desc_map))
             continue
+        if col == "KEGG_KO":
+            columns.append((col, kegg_ko_map))
+            continue
         sub = grouped[grouped["col"] == col]
         per_cluster = dict(zip(sub["cluster_id"], sub["entry"], strict=True))
         columns.append((col, per_cluster))
-    return columns
+    return columns, dict(extra_gene_names)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -379,6 +464,7 @@ def _write_xlsx(
     strains_df: pd.DataFrame,
     wide: pd.DataFrame,
     annotation_columns: list[tuple[str, dict[int, str]]] | None = None,
+    extra_gene_names: dict[int, set[str]] | None = None,
 ) -> None:
     workbook = xlsxwriter.Workbook(str(output_path), {"strings_to_formulas": False})
     worksheet = workbook.add_worksheet("cluster_table")
@@ -400,12 +486,25 @@ def _write_xlsx(
     }
 
     # ── Header row layout ────────────────────────────────────────────────────
-    # Columns: original_order | CLUSTER | annotation | GC% | spread | aa_len |
-    #          flags | total | strain_count | [annotation columns…] |
-    #          <strain1> | <strain2> | …
-    metadata_columns = [
+    # Three blocks left-to-right:
+    #   1. Core metadata (10 columns, ending at 'strain count').
+    #   2. Strain columns (one per strain, narrow + rotated 90° headers).
+    #   3. Annotation columns (KEGG_KO, GO_MF, COG, etc.) at the far right.
+    #
+    # The frozen pane sits at the end of block 1 so you can scroll horizontally
+    # through the strain block AND the annotations while keeping the cluster
+    # name + count info pinned. Annotations are at the right edge because
+    # they're the "look-at-me-once-I've-decided-which-cluster-matters" data —
+    # putting them between metadata and strains made the frozen section
+    # uncomfortably wide.
+    core_metadata = [
         ("original_order",       fmt_cluster, 6),
         ("CLUSTER",              fmt_cluster, max(20, clusters_df["cluster_name"].str.len().max() + 2 if len(clusters_df) else 20)),
+        # Pooled NCBI /gene qualifiers across all cluster members + KEGG-extracted
+        # gene symbols. Biologists search spreadsheets for short gene symbols
+        # (lacZ, dnaA, recA) more often than long product strings — so this
+        # column sits left of NCBI annotation to make sort-then-scroll easy.
+        ("NCBI gene names",      fmt_ncbi,    14),
         ("NCBI annotation",      fmt_ncbi,    45),
         ("GC%",                  fmt_lead,    6),
         ("GC spread",            fmt_lead,    6),
@@ -414,49 +513,96 @@ def _write_xlsx(
         ("total count",          fmt_counts,  6),
         ("strain count",         fmt_counts_border, 6),
     ]
-    # Append annotation columns if present (one per source/aspect pair).
-    annotation_columns = annotation_columns or []
-    for col_name, _ in annotation_columns:
-        metadata_columns.append((col_name, fmt_annot, 24))
+    n_core = len(core_metadata)
 
-    for col_idx, (name, fmt, width) in enumerate(metadata_columns):
+    for col_idx, (name, fmt, width) in enumerate(core_metadata):
         worksheet.write(0, col_idx, name, fmt)
         worksheet.set_column(col_idx, col_idx, width)
 
-    n_meta = len(metadata_columns)
-
-    # Strain headers (rotated, colored by assembly_level)
+    # Block 2: strain headers (rotated, colored by assembly_level)
     for i, row in enumerate(strains_df.itertuples(index=False)):
-        col_idx = n_meta + i
+        col_idx = n_core + i
         fmt = strain_header_formats.get(row.assembly_level, strain_header_formats["Unknown"])
         worksheet.write(0, col_idx, row.header, fmt)
         worksheet.set_column(col_idx, col_idx, 2)  # narrow strain columns
 
-    # Freeze: 1 header row + (n_meta) metadata columns
-    worksheet.freeze_panes(1, n_meta)
+    n_strain = len(strains_df)
+    annotation_section_start = n_core + n_strain
+
+    # Block 3: annotation columns at the right edge
+    annotation_columns = annotation_columns or []
+    for offset, (col_name, _per_cluster) in enumerate(annotation_columns):
+        col_idx = annotation_section_start + offset
+        worksheet.write(0, col_idx, col_name, fmt_annot)
+        worksheet.set_column(col_idx, col_idx, 24)
+
+    # Freeze the cluster-identifier metadata only; strains + annotations scroll.
+    worksheet.freeze_panes(1, n_core)
 
     # ── Data rows ────────────────────────────────────────────────────────────
     for r, (cluster_row, wide_row) in enumerate(
         zip(clusters_df.itertuples(index=False), wide.itertuples(index=False), strict=True),
         start=1,
     ):
+        cluster_id = int(cluster_row.cluster_id)
+        kegg_extras = extra_gene_names.get(cluster_id, set()) if extra_gene_names else set()
+        # Block 1: core metadata (cols 0..9)
         worksheet.write(r, 0, r)                                          # original_order
         worksheet.write(r, 1, cluster_row.cluster_name)
-        worksheet.write(r, 2, cluster_row.consensus_annotation or "")
-        worksheet.write(r, 3, cluster_row.gc_pct if cluster_row.gc_pct is not None else "")
-        worksheet.write(r, 4, cluster_row.gc_spread if cluster_row.gc_spread is not None else "")
-        worksheet.write(r, 5, cluster_row.aa_length if cluster_row.aa_length is not None else "")
-        worksheet.write(r, 6, cluster_row.flags or "")
-        worksheet.write(r, 7, cluster_row.total_count)
-        worksheet.write(r, 8, cluster_row.strain_count, border_right)
-        # Annotation columns, keyed by cluster_id
-        col_idx = 9
-        for _col_name, per_cluster in annotation_columns:
-            worksheet.write(r, col_idx, per_cluster.get(cluster_row.cluster_id, ""))
-            col_idx += 1
-        # Strain columns start at col_idx (== n_meta after the annotation block)
-        for c, value in enumerate(wide_row, start=col_idx):
+        worksheet.write(r, 2, _format_pooled_gene_names(
+            cluster_row.pooled_gene_names, extra=kegg_extras,
+        ))
+        worksheet.write(r, 3, cluster_row.consensus_annotation or "")
+        worksheet.write(r, 4, cluster_row.gc_pct if cluster_row.gc_pct is not None else "")
+        worksheet.write(r, 5, cluster_row.gc_spread if cluster_row.gc_spread is not None else "")
+        worksheet.write(r, 6, cluster_row.aa_length if cluster_row.aa_length is not None else "")
+        worksheet.write(r, 7, cluster_row.flags or "")
+        worksheet.write(r, 8, cluster_row.total_count)
+        worksheet.write(r, 9, cluster_row.strain_count, border_right)
+        # Block 2: strain columns immediately after strain count
+        for c, value in enumerate(wide_row, start=n_core):
             worksheet.write(r, c, value)
+        # Block 3: annotation columns at the far right
+        for offset, (_col_name, per_cluster) in enumerate(annotation_columns):
+            worksheet.write(r, annotation_section_start + offset,
+                            per_cluster.get(cluster_id, ""))
+
+    # xlsxwriter only flushes to disk on close(); without this the file
+    # is silently never created (Workbook's destructor doesn't close).
+    workbook.close()
+
+
+def _format_pooled_gene_names(
+    raw: str | float | None,
+    *,
+    extra: set[str] | None = None,
+) -> str:
+    """Render the 'NCBI gene names' cell, merging gene names from two sources.
+
+    Inputs:
+      raw: GROUP_CONCAT output of distinct `cds.gene_name` values for this
+        cluster (from gbff /gene qualifiers across all members in all strains).
+        Comma-separated string from SQLite, or None/NaN when no NCBI gene
+        names exist.
+      extra: gene symbols pulled from KEGG annotations (e.g. eggNOG-mapper's
+        Preferred_name). Already a Python set, sourced from
+        `_build_annotation_columns`.
+
+    Both inputs are merged into a single sorted set so duplicates collapse
+    (e.g., NCBI's 'dnaA' + eggNOG's 'dnaA' → 'dnaA' once). When all sources
+    are empty the cell renders as the literal 'none', matching strain-comp's
+    sentinel so biologists can still filter for it.
+    """
+    pooled: set[str] = set()
+    if raw is not None and not (isinstance(raw, float) and raw != raw):  # not NaN
+        s = str(raw).strip()
+        if s:
+            pooled.update(part.strip() for part in s.split(",") if part.strip())
+    if extra:
+        pooled.update(extra)
+    if not pooled:
+        return "none"
+    return ", ".join(sorted(pooled))
 
     workbook.close()
 
@@ -521,12 +667,18 @@ def export_strain_anchored_xlsx(
         cell_matrix = _load_cells_for_clusters(
             conn, cluster_run_id, anchor_cds["cluster_id"].unique().tolist(), strains_df,
         )
+        # Same gene-symbol extraction as the pan-genome view, so the
+        # strain-anchored 'NCBI gene names' column gets the same enrichment.
+        _annotation_columns_unused, extra_gene_names = _build_annotation_columns(
+            conn, cluster_run_id, clusters_df=anchor_cds[["cluster_id"]].drop_duplicates(),
+        )
     finally:
         conn.close()
 
     _write_strain_anchored_xlsx(
         output_path, anchor_cds, cell_matrix, strains_df, anchor=anchor,
         has_nt_subcluster=(nt_cluster_run_id is not None),
+        extra_gene_names=extra_gene_names,
     )
 
     return ExportSummary(
@@ -545,19 +697,34 @@ def _load_anchor_cds(
 ) -> pd.DataFrame:
     """Load the anchor strain's CDSs joined to their protein cluster.
 
+    Also pools each cluster's NCBI gene names (across all members in all
+    strains) into the `pooled_gene_names` column. The anchor CDS's own
+    `gene_name` column is kept separately — so a biologist can see both
+    "what NCBI called THIS copy" and "what NCBI called ANY copy of this
+    gene family in the whole dataset".
+
     If `nt_cluster_run_id` is provided, also LEFT JOINs the matching nucleotide
     cluster name as the column `nt_cluster_name`. CDSs not found in the nt
     run (rare; only if some CDSs were missing from the nt clustering input)
     get NULL.
     """
+    pooled_subquery = """(
+        SELECT GROUP_CONCAT(DISTINCT c2.gene_name)
+        FROM cluster_membership m2
+        JOIN cds c2 ON c2.cds_id = m2.cds_id
+        WHERE m2.cluster_id = cl.cluster_id
+          AND c2.gene_name IS NOT NULL
+          AND c2.gene_name != ''
+    )"""
     if nt_cluster_run_id is None:
         return pd.read_sql_query(
-            """
+            f"""
             SELECT
                 c.cds_id, c.locus_tag, c.protein_id, c.nuc_accession,
                 c.location, c.gene_name, c.aa_length,
                 cl.cluster_id, cl.cluster_name, cl.consensus_annotation,
                 cl.member_count, cl.strain_count,
+                {pooled_subquery} AS pooled_gene_names,
                 NULL AS nt_cluster_name
             FROM cds c
             JOIN cluster_membership m ON m.cds_id = c.cds_id AND m.cluster_run_id = ?
@@ -569,12 +736,13 @@ def _load_anchor_cds(
             params=(cluster_run_id, anchor_strain_id),
         )
     return pd.read_sql_query(
-        """
+        f"""
         SELECT
             c.cds_id, c.locus_tag, c.protein_id, c.nuc_accession,
             c.location, c.gene_name, c.aa_length,
             cl.cluster_id, cl.cluster_name, cl.consensus_annotation,
             cl.member_count, cl.strain_count,
+            {pooled_subquery} AS pooled_gene_names,
             nt_cl.cluster_name AS nt_cluster_name
         FROM cds c
         JOIN cluster_membership m  ON m.cds_id = c.cds_id  AND m.cluster_run_id = ?
@@ -621,6 +789,7 @@ def _write_strain_anchored_xlsx(
     *,
     anchor: sqlite3.Row,
     has_nt_subcluster: bool = False,
+    extra_gene_names: dict[int, set[str]] | None = None,
 ) -> None:
     workbook = xlsxwriter.Workbook(str(output_path), {"strings_to_formulas": False})
     sheet_name = f"{anchor['locus_prefix']}_anchored"[:31]  # Excel sheet-name cap
@@ -645,6 +814,8 @@ def _write_strain_anchored_xlsx(
     # Metadata column layout — different from the pan-genome view.
     # nt_subcluster (when present) sits right after the protein CLUSTER
     # so a biologist can see at a glance: protein family + nt lineage.
+    # NCBI gene names is the pooled /gene qualifier column (distinct from
+    # the per-row `gene` column which shows the anchor CDS's own value).
     metadata_columns: list[tuple[str, object, int]] = [
         ("position",          fmt_cluster, 6),
         ("anchor_locus_tag",  fmt_cluster, 22),
@@ -656,6 +827,7 @@ def _write_strain_anchored_xlsx(
     if has_nt_subcluster:
         metadata_columns.append(("nt_subcluster", fmt_cluster, 18))
     metadata_columns.extend([
+        ("NCBI gene names",   fmt_ncbi,    14),
         ("NCBI annotation",   fmt_ncbi,    45),
         ("aa length",         fmt_lead,    6),
         ("cluster total",     fmt_counts,  7),
@@ -706,10 +878,20 @@ def _write_strain_anchored_xlsx(
             nt_name = getattr(anchor_row, "nt_cluster_name", None)
             worksheet.write(r, col, nt_name if nt_name else "")
             col += 1
-        worksheet.write(r, col,     anchor_row.consensus_annotation or "")
-        worksheet.write(r, col + 1, anchor_row.aa_length if anchor_row.aa_length else "")
-        worksheet.write(r, col + 2, anchor_row.member_count)
-        worksheet.write(r, col + 3, anchor_row.strain_count)
+        # Pooled NCBI gene names — merged with KEGG-extracted gene symbols
+        # so a biologist scrolling row-by-row sees a unified pool. May be
+        # absent from older anchor-CDS rows if the query wasn't updated;
+        # guard with getattr to be safe.
+        pooled = getattr(anchor_row, "pooled_gene_names", None)
+        cluster_id = int(anchor_row.cluster_id)
+        kegg_extras = (
+            extra_gene_names.get(cluster_id, set()) if extra_gene_names else set()
+        )
+        worksheet.write(r, col,     _format_pooled_gene_names(pooled, extra=kegg_extras))
+        worksheet.write(r, col + 1, anchor_row.consensus_annotation or "")
+        worksheet.write(r, col + 2, anchor_row.aa_length if anchor_row.aa_length else "")
+        worksheet.write(r, col + 3, anchor_row.member_count)
+        worksheet.write(r, col + 4, anchor_row.strain_count)
 
         for strain_id, col_idx in strain_col_index.items():
             if strain_id == anchor_strain_id:

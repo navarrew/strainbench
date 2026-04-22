@@ -281,6 +281,12 @@ def parse_emapper(path: Path) -> Iterable[ClusterAnnotationRow]:
                     )
 
         # 6. Pfam domains
+        # Don't duplicate the Pfam ID into `name` — that produces ugly
+        # "Ribonuc_red_sm Ribonuc_red_sm" cells. The ID itself is the name
+        # for Pfam's short codes, so leave name=None and the entry text
+        # collapses to a single token. InterProScan can also produce Pfam
+        # rows with descriptive names; both flow through the same KEGG-style
+        # dedup later if needed.
         pfams = _clean(row.get("PFAMs"))
         if pfams:
             for pf in pfams.split(","):
@@ -288,7 +294,7 @@ def parse_emapper(path: Path) -> Iterable[ClusterAnnotationRow]:
                 if pf_clean:
                     yield ClusterAnnotationRow(
                         cluster_name=cluster_name, source="Pfam", code=pf_clean,
-                        category=None, name=pf_clean, description=None,
+                        category=None, name=None, description=None,
                         score=None, extra=None,
                     )
 
@@ -489,12 +495,15 @@ def parse_amrfinder(path: Path) -> Iterable[ClusterAnnotationRow]:
                     "Closest reference accession", "Accession of closest reference",
                 ) if row.get(k) and row[k].strip()
             }
+            # `name` deliberately left None — for AMRFinder the gene symbol IS
+            # the code (e.g., 'tetM'), so duplicating it into name produces
+            # ugly 'tetM tetM' cells in the xlsx.
             yield ClusterAnnotationRow(
                 cluster_name=cluster_name,
                 source="AMRFinder",
                 code=gene or None,
                 category=element_type or None,
-                name=gene or None,
+                name=None,
                 description=seq_name or (f"{drug_class}/{drug_subcl}" if drug_class else None),
                 score=pct_id,
                 extra=_json.dumps(extras) if extras else None,
@@ -783,6 +792,14 @@ def _load_go_aspects() -> dict[str, tuple[str, str]]:
 
 
 def _resolve_cluster_run_id(conn: sqlite3.Connection, requested: int | None) -> int:
+    """Pick a cluster_run for annotation import. Prefers protein runs by default.
+
+    Annotations come from external tools that ran on the protein cluster reps
+    (`strainbench export-reps` produces a protein FASTA). Importing those
+    against a nucleotide cluster_run would silently mismatch all names — the
+    namespace is INERS_NT_xxxxxx vs INERS_xxxxxx. Defaulting to protein
+    avoids that footgun. Caller can override with explicit cluster_run_id.
+    """
     if requested is not None:
         row = conn.execute(
             "SELECT cluster_run_id FROM cluster_runs WHERE cluster_run_id = ?",
@@ -792,8 +809,12 @@ def _resolve_cluster_run_id(conn: sqlite3.Connection, requested: int | None) -> 
             raise ValueError(f"cluster_run_id={requested} not found")
         return requested
     row = conn.execute(
-        "SELECT cluster_run_id FROM cluster_runs "
-        "WHERE is_active = 1 ORDER BY cluster_run_id DESC LIMIT 1"
+        """
+        SELECT cluster_run_id FROM cluster_runs
+        WHERE is_active = 1
+        ORDER BY (sequence_type = 'protein') DESC, cluster_run_id DESC
+        LIMIT 1
+        """
     ).fetchone()
     if row is None:
         raise ValueError("No active cluster_runs in DB")
