@@ -9,6 +9,7 @@ Subcommands so far:
     export-xlsx — export the strain × cluster matrix as a formatted .xlsx
     export-strain-table — strain-anchored view: rows = one strain's CDSs in genomic order
     export-reps — export cluster representative sequences as FASTA
+    export-cluster-region — export every cluster member with N bp upstream/downstream context
     annotate-prep — generate a workdir with shell templates for external annotators
     import-annotation — import annotator output (single file or whole workdir)
     export-strainlist — write strainlist.txt (one strain header per line) in dendrogram order
@@ -477,6 +478,69 @@ def cmd_export_reps(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_cluster_region(args: argparse.Namespace) -> int:
+    import time
+
+    from strainbench.producer.export_cluster_region import export_cluster_region
+
+    db_path = Path(args.db)
+    if not db_path.exists():
+        print(f"Database not found: {db_path}", file=sys.stderr)
+        return 1
+
+    selectors = sum(x is not None for x in (
+        args.cluster_name, args.gene_name, args.annotation_pattern,
+    ))
+    if selectors != 1:
+        print(
+            "Specify exactly one of --cluster-name, --gene-name, "
+            "or --annotation-pattern.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        f"Exporting cluster region from {db_path} "
+        f"(upstream={args.upstream}bp, downstream={args.downstream}bp) → {args.output}"
+    )
+    t0 = time.time()
+    try:
+        summary = export_cluster_region(
+            db_path, args.output,
+            cluster_name=args.cluster_name,
+            gene_name=args.gene_name,
+            annotation_pattern=args.annotation_pattern,
+            cluster_run_id=args.cluster_run_id,
+            upstream_bp=args.upstream,
+            downstream_bp=args.downstream,
+            gbff_root=args.gbff_root,
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"\nExport failed: {exc}", file=sys.stderr)
+        return 1
+    dt = time.time() - t0
+
+    print(f"\nDone in {dt:.1f}s.")
+    print(f"  cluster:        {summary.cluster_name} (cluster_id={summary.cluster_id}, "
+          f"run_id={summary.cluster_run_id})")
+    print(f"  members:        {summary.n_members_total}")
+    print(f"  records written:{summary.n_records_written}")
+    if summary.n_strains_missing_gbff:
+        print(f"  ⚠ strains with missing source gbff: {summary.n_strains_missing_gbff}")
+        for p in summary.missing_gbff_paths[:5]:
+            print(f"      {p}")
+        if len(summary.missing_gbff_paths) > 5:
+            print(f"      ... and {len(summary.missing_gbff_paths) - 5} more")
+    if summary.n_members_missing_locus_tag:
+        print(f"  ⚠ locus_tags not found in their gbff: {summary.n_members_missing_locus_tag}")
+    if summary.n_members_truncated_window:
+        print(f"  ⚠ flanking window truncated by contig boundary for "
+              f"{summary.n_members_truncated_window} members "
+              f"(see [upstream=X/Ybp] in headers)")
+    print(f"  output:         {summary.output_path}")
+    return 0
+
+
 def cmd_import_annotation(args: argparse.Namespace) -> int:
     import time
 
@@ -876,6 +940,49 @@ def build_parser() -> argparse.ArgumentParser:
              "Required when --full-length-only is set.",
     )
     p_reps.set_defaults(func=cmd_export_reps)
+
+    p_region = subparsers.add_parser(
+        "export-cluster-region",
+        help="Export every member of a cluster as 'gene + N bp upstream/downstream', "
+             "re-extracted from each strain's source gbff. Useful for promoter MSAs.",
+    )
+    p_region.add_argument("--db", required=True)
+    p_region.add_argument("-o", "--output", required=True,
+                          help="Output multi-FASTA path.")
+    p_region.add_argument(
+        "--cluster-name", default=None,
+        help="Exact strainbench cluster name, e.g. GARD_000458. "
+             "Mutually exclusive with --gene-name and --annotation-pattern.",
+    )
+    p_region.add_argument(
+        "--gene-name", default=None,
+        help="Look up cluster via cds.gene_name (case-insensitive exact match), "
+             "e.g. 'vly'. Errors if multiple clusters match.",
+    )
+    p_region.add_argument(
+        "--annotation-pattern", default=None,
+        help="Look up cluster via cds.annotation LIKE '%%PATTERN%%' "
+             "(case-insensitive). Errors if multiple clusters match.",
+    )
+    p_region.add_argument(
+        "--cluster-run-id", type=int, default=None,
+        help="Constrain cluster lookup to this run (default: most recent active "
+             "protein run — the natural ortholog-group axis).",
+    )
+    p_region.add_argument(
+        "--upstream", type=int, default=100,
+        help="Bases of 5' UTR to prepend (strand-aware). Default: 100.",
+    )
+    p_region.add_argument(
+        "--downstream", type=int, default=0,
+        help="Bases of 3' UTR to append (strand-aware). Default: 0.",
+    )
+    p_region.add_argument(
+        "--gbff-root", default=None,
+        help="Root directory the relative paths in strains.source_file are "
+             "anchored to. Default: the directory holding the .db file.",
+    )
+    p_region.set_defaults(func=cmd_export_cluster_region)
 
     p_import = subparsers.add_parser(
         "import-annotation",
